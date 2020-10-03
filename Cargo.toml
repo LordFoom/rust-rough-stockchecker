@@ -1,0 +1,19 @@
+[package]
+name = "stockchecker"
+version = "0.1.0"
+authors = ["LordFoom <lordfoom@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+reqwest = { version = "0.10", features = ["json"] }
+tokio = { version = "0.2", features = ["full"] }
+select = "0.5.0"
+clap = "3.0.0-beta.1"
+regex = "1"
+prettytable-rs = "^0.8"
+chrono = "0.4"
+mysql = "*"
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"]}
