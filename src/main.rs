@@ -56,7 +56,7 @@ async fn main() -> Result<(), reqwest::Error> {
 async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<Share>, reqwest::Error> {
     let mut company_prices = Vec::new();
     for company_code in company_codes {
-        let res = reqwest::get(&format!("https://www.google.com/search?hl=en&q={}", company_code)).await?;
+        let res = reqwest::get(&format!("https://www.google.com/search?hl=en&q=share+price+{}", company_code)).await?;
         let body = res.text().await?;
         // println!("Body:\n{}", body);
         let search_doc = Document::from(body.borrow());
