@@ -1707,6 +1707,7 @@ dependencies = [
  "prettytable-rs",
  "regex",
  "reqwest",
+ "rust_decimal",
  "select",
  "serde",
  "serde_json",

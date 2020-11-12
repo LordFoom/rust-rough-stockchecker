@@ -2,17 +2,19 @@
 extern crate prettytable;
 
 use std::borrow::Borrow;
+use std::str::FromStr;
 
 use chrono::prelude::*;
 use clap::{App, Arg, ArgMatches};
-use mysql::{OptsBuilder, Pool, params};
+use mysql::{OptsBuilder, Pool, params, PooledConn};
 use mysql::prelude::*;
-use prettytable::Table;
+use prettytable::{Table, Cell, Attr, Row, color};
 use regex::Regex;
 use select::document::Document;
 use select::predicate::Name;
 
-use crate::share_price_model::Share;
+use crate::share_price_model::{Share, ShareComparison};
+use rust_decimal::Decimal;
 
 mod share_price_model;
 mod config_options;
@@ -36,24 +38,23 @@ fn init() -> ArgMatches {
 
 
 #[tokio::main]
-async fn main() -> Result<(), reqwest::Error> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = init();
     let company_codes: Vec<_> = args.values_of("code").unwrap().collect();
 
     let mut company_prices = get_company_prices(company_codes).await?;
-
-
     print_prices(&mut company_prices);
-
     if let Err(e) = save_prices(&mut company_prices) {
         panic!("Couldn't save prices {}", e.to_string())
     }
+
 
     Ok(())
 }
 
 // #[tokio::main]
-async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<Share>, reqwest::Error> {
+async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<ShareComparison>,  Box<dyn std::error::Error>> {
+    let mut conn = get_db_connection()?;
     let mut company_prices = Vec::new();
     for company_code in company_codes {
         let res = reqwest::get(&format!("https://www.google.com/search?hl=en&q=share+price+{}", company_code)).await?;
@@ -76,12 +77,26 @@ async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<Share>, reqw
                 break;
             }
         }
+        //get the previous price from the company, if it exists
+        let company_history =  match conn.exec_first(r"SELECT company_code as code, price, price_date
+                         FROM stock_prices WHERE company_code = :code
+                         AND date(price_date) <= curdate() - INTERVAL 1 DAY ORDER BY id DESC",
+                                              params! {"code"=>company_code.to_string()} ){
+            Ok(Some((code, price, price_date))) => Some(Share{code, price, price_date}),
+            Ok(None) => None,
+            Err(e) => panic!("Unable to get previous company info: {}", e.to_string()),
+        };
 
-        let now = Utc::now();
+        let now = Utc::now().naive_utc();
         let company = Share {
             code: company_code.to_string(),
             price: price.clone(),
             price_date: now,
+        };
+
+        let share_comparison = ShareComparison{
+            share:company,
+            share_history: company_history,
         };
         // println!("{} = {} at {}",
         //          company.code,
@@ -89,35 +104,79 @@ async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<Share>, reqw
         //          company.price_date.format("%Y-%m-%d %H:%M:%S").to_string()
         // );
 
-        company_prices.push(company);
+        company_prices.push(share_comparison);
     }
     Ok(company_prices)
 }
 
-fn print_prices(company_prices: &mut Vec<Share>) {
+fn print_prices(company_prices: &mut Vec<ShareComparison>) {
     let mut tbl = Table::new();
-    tbl.add_row(row!["CODE", "PRICE", "TIME"]);
-    for company in company_prices {
-        tbl.add_row(row![company.code, company.price, company.display_date()]);
+    tbl.add_row(Row::new(vec![
+        Cell::new("CODE" )
+            .with_style(Attr::Bold)
+            .with_style(Attr::ForegroundColor(color::BLUE))
+        ,
+        Cell::new("CURRENT PRICE" )
+            .with_style(Attr::Bold)
+            .with_style(Attr::ForegroundColor(color::YELLOW))
+        ,
+        Cell::new("CURR TIME" )
+            .with_style(Attr::Bold)
+            .with_style(Attr::ForegroundColor(color::YELLOW))
+        ,
+        Cell::new("LAST PRICE" )
+            .with_style(Attr::Bold)
+            .with_style(Attr::ForegroundColor(color::BRIGHT_BLUE))
+        ,
+        Cell::new("LAST PRICE TIME" )
+            .with_style(Attr::Bold)
+            .with_style(Attr::ForegroundColor(color::BRIGHT_BLUE))
+        ,
+        Cell::new("MOVEMENT" )
+            .with_style(Attr::Bold)
+            .with_style(Attr::ForegroundColor(color::BRIGHT_YELLOW))
+        ,
+    ]));
+    for share_comparison in company_prices {
+        let proper_decimal = str::replace(&share_comparison.price().trim(), ",", ".");
+        let proper_historic_decimal = str::replace(&share_comparison.historic_price().trim(), ",", ".");
+        let now_price = match Decimal::from_str(&proper_decimal) {
+            Ok(dec) => dec,
+            Err(e) => panic!("Couldn't make price into a number: {}", e.to_string())
+        };
+        let last_price = match Decimal::from_str(&proper_historic_decimal){
+            Ok(dec) => dec,
+            Err(e) => panic!("Couldn't make price into a number: {}", e.to_string())
+        };
+
+        let movement = now_price - last_price;
+
+        tbl.add_row(Row::new(vec![
+            Cell::new(&share_comparison.code()),
+            Cell::new(&share_comparison.price()),
+            Cell::new(&share_comparison.latest_date()),
+            Cell::new(&share_comparison.historic_price()),
+            Cell::new(&share_comparison.historic_date()),
+            if movement < Decimal::new(0, 0){
+                Cell::new(&movement.to_string())
+                    .with_style(Attr::Bold)
+                    .with_style(Attr::ForegroundColor(color::RED))
+            }else{
+                Cell::new(&movement.to_string())
+                    .with_style(Attr::Bold)
+                    .with_style(Attr::ForegroundColor(color::GREEN))
+            }
+        ]));
     }
 
     tbl.printstd();
 }
 
-fn save_prices(company_prices: &mut Vec<Share>) -> Result<(), Box<dyn std::error::Error>> {
+fn save_prices(company_prices: &mut Vec<ShareComparison>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut conn = get_db_connection()?;
     //db connection
-    let conn_details = match config_options::read_db_config() {
-        Ok(connection) => connection,
-        Err(e) => panic!("TIME TO DIE, CONNECTION! {}", e.to_string()),
-    };
-    //read db connection stuff from database
-    let builder = OptsBuilder::new()
-        .user(Some(conn_details.username))
-        .pass(Some(conn_details.password))
-        .db_name(Some(conn_details.database));
+    // let mut conn = get_db_connection();
 
-    let pool = Pool::new(builder)?;
-    let mut conn = pool.get_conn()?;
     //create table if needed
     conn.query_drop(
         r"CREATE TABLE IF NOT EXISTS stock_prices
@@ -136,10 +195,25 @@ fn save_prices(company_prices: &mut Vec<Share>) -> Result<(), Box<dyn std::error
         company_prices
             .iter()
             .map(|company| params! {
-                        "code" => &company.code,
-                        "price" => str::replace(&company.price, ",", "."),
+                        "code" => &company.share.code,
+                        "price" => str::replace(&company.share.price, ",", "."),
                     }
             ))?;
 
     Ok(())
+}
+
+fn get_db_connection() -> Result<PooledConn, Box<dyn std::error::Error>> {
+    let conn_details = match config_options::read_db_config() {
+        Ok(connection) => connection,
+        Err(e) => panic!("TIME TO DIE, CONNECTION! {}", e.to_string()),
+    };
+    //read db connection stuff from database
+    let builder = OptsBuilder::new()
+        .user(Some(conn_details.username))
+        .pass(Some(conn_details.password))
+        .db_name(Some(conn_details.database));
+
+    let pool = Pool::new(builder)?;
+    Ok(pool.get_conn()?)
 }
