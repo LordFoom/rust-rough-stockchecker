@@ -6,15 +6,15 @@ use std::str::FromStr;
 
 use chrono::prelude::*;
 use clap::{App, Arg, ArgMatches};
-use mysql::{OptsBuilder, Pool, params, PooledConn};
+use mysql::{OptsBuilder, params, Pool, PooledConn};
 use mysql::prelude::*;
-use prettytable::{Table, Cell, Attr, Row, color};
+use prettytable::{Attr, Cell, color, Row, Table};
 use regex::Regex;
+use rust_decimal::Decimal;
 use select::document::Document;
 use select::predicate::Name;
 
 use crate::share_price_model::{Share, ShareComparison};
-use rust_decimal::Decimal;
 
 mod share_price_model;
 mod config_options;
@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // #[tokio::main]
-async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<ShareComparison>,  Box<dyn std::error::Error>> {
+async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<ShareComparison>, Box<dyn std::error::Error>> {
     let mut conn = get_db_connection()?;
     let mut company_prices = Vec::new();
     for company_code in company_codes {
@@ -62,7 +62,7 @@ async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<ShareCompari
         // println!("Body:\n{}", body);
         let search_doc = Document::from(body.borrow());
         // let spans = search_doc.find(Name("span")).collect();
-        let starts_with_digits = Regex::new(r"(^[\d+\s]*\d+,\d+\s)").unwrap();
+        let starts_with_digits = Regex::new(r"(^[\d+\s]*\d+,.\d+\s)").unwrap();
 
         let mut price = String::new();
 
@@ -72,17 +72,17 @@ async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<ShareCompari
                 && starts_with_digits.is_match(&txt)
             {
                 let captures = starts_with_digits.captures(&txt).unwrap();
-                price = captures[1].to_string();
+                price = str::replace(&captures[1], ",", ".");
                 // println!("div=={}",  txt);
                 break;
             }
         }
         //get the previous price from the company, if it exists
-        let company_history =  match conn.exec_first(r"SELECT company_code as code, price, price_date
+        let company_history = match conn.exec_first(r"SELECT company_code as code, price, price_date
                          FROM stock_prices WHERE company_code = :code
                          AND date(price_date) <= curdate() - INTERVAL 1 DAY ORDER BY id DESC",
-                                              params! {"code"=>company_code.to_string()} ){
-            Ok(Some((code, price, price_date))) => Some(Share{code, price, price_date}),
+                                                    params! {"code"=>company_code.to_string()}) {
+            Ok(Some((code, price, price_date))) => Some(Share { code, price, price_date }),
             Ok(None) => None,
             Err(e) => panic!("Unable to get previous company info: {}", e.to_string()),
         };
@@ -94,8 +94,8 @@ async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<ShareCompari
             price_date: now,
         };
 
-        let share_comparison = ShareComparison{
-            share:company,
+        let share_comparison = ShareComparison {
+            share: company,
             share_history: company_history,
         };
         // println!("{} = {} at {}",
@@ -112,27 +112,31 @@ async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<ShareCompari
 fn print_prices(company_prices: &mut Vec<ShareComparison>) {
     let mut tbl = Table::new();
     tbl.add_row(Row::new(vec![
-        Cell::new("CODE" )
+        Cell::new("CODE")
             .with_style(Attr::Bold)
             .with_style(Attr::ForegroundColor(color::BLUE))
         ,
-        Cell::new("CURRENT PRICE" )
+        Cell::new("CURRENT PRICE")
             .with_style(Attr::Bold)
             .with_style(Attr::ForegroundColor(color::YELLOW))
         ,
-        Cell::new("CURR TIME" )
+        Cell::new("CURR TIME")
             .with_style(Attr::Bold)
             .with_style(Attr::ForegroundColor(color::YELLOW))
         ,
-        Cell::new("LAST PRICE" )
+        Cell::new("LAST PRICE")
             .with_style(Attr::Bold)
             .with_style(Attr::ForegroundColor(color::BRIGHT_BLUE))
         ,
-        Cell::new("LAST PRICE TIME" )
+        Cell::new("LAST PRICE TIME")
             .with_style(Attr::Bold)
             .with_style(Attr::ForegroundColor(color::BRIGHT_BLUE))
         ,
-        Cell::new("MOVEMENT" )
+        Cell::new("MOVEMENT")
+            .with_style(Attr::Bold)
+            .with_style(Attr::ForegroundColor(color::BRIGHT_YELLOW))
+        ,
+        Cell::new("%")
             .with_style(Attr::Bold)
             .with_style(Attr::ForegroundColor(color::BRIGHT_YELLOW))
         ,
@@ -144,12 +148,20 @@ fn print_prices(company_prices: &mut Vec<ShareComparison>) {
             Ok(dec) => dec,
             Err(e) => panic!("Couldn't make price into a number: {}", e.to_string())
         };
-        let last_price = match Decimal::from_str(&proper_historic_decimal){
+        let last_price = match Decimal::from_str(&proper_historic_decimal) {
             Ok(dec) => dec,
             Err(e) => panic!("Couldn't make price into a number: {}", e.to_string())
         };
 
         let movement = now_price - last_price;
+        let percentage = (((now_price / last_price) * Decimal::from_str("100.00").unwrap())-Decimal::from(100));
+        // let mut percen
+        let mut percentage_string = format!("{}%", percentage.to_string());
+        let (movement_style, percentage_string) = if movement < Decimal::from_str("0.0").unwrap() {
+            (Attr::ForegroundColor(color::RED), format!("-{:.5}%", percentage))
+        } else {
+            (Attr::ForegroundColor(color::GREEN), format!("+{:.5}%", percentage))
+        };
 
         tbl.add_row(Row::new(vec![
             Cell::new(&share_comparison.code()),
@@ -157,15 +169,12 @@ fn print_prices(company_prices: &mut Vec<ShareComparison>) {
             Cell::new(&share_comparison.latest_date()),
             Cell::new(&share_comparison.historic_price()),
             Cell::new(&share_comparison.historic_date()),
-            if movement < Decimal::new(0, 0){
-                Cell::new(&movement.to_string())
-                    .with_style(Attr::Bold)
-                    .with_style(Attr::ForegroundColor(color::RED))
-            }else{
-                Cell::new(&movement.to_string())
-                    .with_style(Attr::Bold)
-                    .with_style(Attr::ForegroundColor(color::GREEN))
-            }
+            Cell::new(&movement.to_string())
+                .with_style(Attr::Bold)
+                .with_style(movement_style),
+            Cell::new(&percentage_string)
+                .with_style(Attr::Bold)
+                .with_style(movement_style),
         ]));
     }
 
