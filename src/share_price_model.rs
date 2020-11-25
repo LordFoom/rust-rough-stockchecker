@@ -1,4 +1,5 @@
 use chrono::prelude::*;
+use std::collections::HashMap;
 
 pub struct Share{
     pub code: String,
@@ -11,6 +12,29 @@ const DATE_FMT:  &str = "%Y-%m-%d %H:%M:%S";
 impl Share{
     pub fn display_date(&self)->String{
         self.price_date.format(DATE_FMT).to_string()
+    }
+    pub fn pretty_price(&self) -> String {
+        str::replace(self.share.price().trim(), ",", ".")
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub enum ShareHistoryPoint{
+    Current,
+    Yesterday,
+    DaysAgo(i32),
+    LastWeek,
+    LastMonth
+}
+
+pub struct ShareTimeline {
+    pub share: Share,
+    pub share_history:HashMap<ShareHistoryPoint, Share>
+}
+
+impl ShareTimeline {
+    pub fn get_share_at_moment(&self, &share_hst_pnt: ShareHistoryPoint) -> Option<&Share> {
+        self.share_history.get(share_hst_pnt)
     }
 }
 
