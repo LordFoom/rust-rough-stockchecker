@@ -2,7 +2,9 @@
 extern crate prettytable;
 
 use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::string::ToString;
 
 use chrono::prelude::*;
 use clap::{App, Arg, ArgMatches};
@@ -14,8 +16,8 @@ use rust_decimal::Decimal;
 use select::document::Document;
 use select::predicate::Name;
 
-use crate::share_price_model::{Share, ShareTimeline, ShareHistoryPoint};
-use std::collections::HashMap;
+use crate::share_price_model::{Share, ShareMoment, ShareTimeline};
+use rust_decimal::prelude::Zero;
 
 mod share_price_model;
 mod config_options;
@@ -72,7 +74,7 @@ async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<ShareTimelin
         for span in search_doc.find(Name("div")) {
             let txt = span.text();
             if txt.contains("Currency in ")
-                && starts_with_digits.is_match(&txt){
+                && starts_with_digits.is_match(&txt) {
                 let captures = starts_with_digits.captures(&txt).unwrap();
                 price = str::replace(&captures[1], ",", ".");
                 // println!("div=={}",  txt);
@@ -94,20 +96,20 @@ async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<ShareTimelin
         //todo, we need to move this into its own method and out of here
         let mut share_history = HashMap::new();
 
-        if let Some(share) = load_share_history(company_code, 1){
-            share_history.insert(ShareHistoryPoint::Yesterday, share);
+        if let Some(share) = load_share_history(company_code, 1) {
+            share_history.insert(ShareMoment::Yesterday, share);
         }
-        if let Some(share) = load_share_history(company_code, 7){
-            share_history.insert(ShareHistoryPoint::LastWeek, share);
+        if let Some(share) = load_share_history(company_code, 7) {
+            share_history.insert(ShareMoment::LastWeek, share);
         }
-        if let Some(share) = load_share_history(company_code,30){
-            share_history.insert(ShareHistoryPoint::LastMonth, share);
+        if let Some(share) = load_share_history(company_code, 30) {
+            share_history.insert(ShareMoment::LastMonth, share);
         }
 
 
         let share_timeline = ShareTimeline {
             share: company_curr,
-            share_history
+            share_history,
         };
         // let share_comparison = ShareComparison {
         //     share: company,
@@ -124,24 +126,87 @@ async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<ShareTimelin
     Ok(company_prices)
 }
 
-fn load_share_history(company_code:&str, days_ago_upper_limit: i32)->Option<Share>{
+fn load_share_history(company_code: &str, days_ago_upper_limit: i32) -> Option<Share> {
     let mut conn = get_db_connection().unwrap();
     let base_select = r"SELECT company_code as code, price, price_date
                          FROM stock_prices WHERE company_code = :code
                          AND date(price_date) <= curdate() ";
-    let suffix_select:String = String::from("- INTERVAL {} DAY ORDER BY id DESC");
+    let suffix_select: String = String::from("- INTERVAL {} DAY ORDER BY id DESC");
     let yest_select = format!("{} - INTERVAL {} DAY ORDER BY id DESC ", base_select, days_ago_upper_limit);
     match conn.exec_first(yest_select,
-                            params! {"code"=>company_code}) {
+                          params! {"code"=>company_code}) {
         Ok(Some((code, price, price_date))) => Some(Share { code, price, price_date }),
         Ok(None) => None,
         Err(e) => panic!("Unable to get previous company info: {}", e.to_string()),
     }
 }
 
+fn construct_current_moment_share_columns(share: &share_price_model::Share) -> Vec<Cell> {
+    vec![
+        Cell::new(&share.code),
+        Cell::new(&share.pretty_price()),
+        Cell::new(&share.display_date()),
+    ]
+}
+
+fn construct_historic_moment_share_columns(share_history: &share_price_model::Share, share: &share_price_model::Share) -> Vec<Cell> {
+    //calculate the price difference
+    let curr_price = share.price_as_decimal();
+    let historic_price = share_history.price_as_decimal();
+    let movement= curr_price - historic_price;
+
+    //calculate percentage price change
+    let percentage_movement = (curr_price / historic_price) * Decimal::from(100) - Decimal::from(100);
+    let (movement_style, percentage_string) = if movement < Decimal::zero(){
+        (Attr::ForegroundColor(color::RED), format!("-{:.5}%", percentage_movement))
+    } else {
+        (Attr::ForegroundColor(color::GREEN), format!("+{:.5}%", percentage_movement))
+    };
+    vec![
+        Cell::new(&share_history.pretty_price()),
+        Cell::new(&share_history.display_date()),
+        Cell::new(&movement.to_string())
+            .with_style(Attr::Bold)
+            .with_style(movement_style),
+        Cell::new(&percentage_string)
+            .with_style(Attr::Bold)
+            .with_style(movement_style),
+
+    ]
+}
+
 fn print_prices(company_prices: &Vec<ShareTimeline>) {
     let mut tbl = Table::new();
-    tbl.add_row(Row::new(vec![
+    let header_vec = construct_table_header(company_prices);
+    tbl.add_row(Row::new(header_vec));
+
+    for share_timeline in company_prices {
+        let mut share_row:Vec<Cell> = Vec::new();
+        //initialize the row wit the share stuff
+        let str_curr_price = share_timeline.share.pretty_price();
+        let dec_curr_price = share_timeline.share.price_as_decimal();
+        share_row.append(&mut construct_current_moment_share_columns(&share_timeline.share));
+        for historic_share_key in share_timeline.share_history.keys(){
+            share_row.append(&mut construct_historic_moment_share_columns(share_timeline.share_history.get(historic_share_key).unwrap(), &share_timeline.share));
+        }
+        tbl.add_row(Row::new(share_row));
+    }
+
+    tbl.printstd();
+}
+
+fn construct_table_header(company_prices: &Vec<ShareTimeline>) -> Vec<Cell> {
+    let mut header_vec = construct_default_headers();
+
+    //get the first shares history - all shares should have the same history....
+    for share_moment in company_prices[0].share_history.keys(){
+        header_vec.append(&mut construct_price_cell_headers(share_moment));
+    }
+    header_vec
+}
+
+fn construct_default_headers() -> Vec<Cell> {
+    vec![
         Cell::new("CODE")
             .with_style(Attr::Bold)
             .with_style(Attr::ForegroundColor(color::BLUE))
@@ -154,72 +219,44 @@ fn print_prices(company_prices: &Vec<ShareTimeline>) {
             .with_style(Attr::Bold)
             .with_style(Attr::ForegroundColor(color::YELLOW))
         ,
-        Cell::new("LAST PRICE")
-            .with_style(Attr::Bold)
-            .with_style(Attr::ForegroundColor(color::BRIGHT_BLUE))
-        ,
-        Cell::new("LAST PRICE TIME")
-            .with_style(Attr::Bold)
-            .with_style(Attr::ForegroundColor(color::BRIGHT_BLUE))
-        ,
-        Cell::new("MOVEMENT")
-            .with_style(Attr::Bold)
-            .with_style(Attr::ForegroundColor(color::BRIGHT_YELLOW))
-        ,
-        Cell::new("%")
-            .with_style(Attr::Bold)
-            .with_style(Attr::ForegroundColor(color::BRIGHT_YELLOW))
-        ,
-    ]));
-    for share_timeline in company_prices {
-
-        let str_curr_price = share_timeline.share.pretty_price();
-        let str_yest_price = price_str_at_moment(share_timeline, ShareHistoryPoint::Yesterday);
-        let str_last_week_price = price_str_at_moment(share_timeline, ShareHistoryPoint::LastWeek);
-        let str_last_month_price = price_str_at_moment(share_timeline, ShareHistoryPoint::LastMonth);
-        let now_price = match Decimal::from_str(&str_curr_price) {
-            Ok(dec) => dec,
-            Err(e) => panic!("Couldn't make price into a number: {}", e.to_string())
-        };
-        let last_price = match Decimal::from_str(&str_yest_price) {
-            Ok(dec) => dec,
-            Err(e) => panic!("Couldn't make price into a number: {}", e.to_string())
-        };
-
-        let movement = now_price - last_price;
-        let percentage = (now_price / last_price) * Decimal::from_str("100.00").unwrap()-Decimal::from(100);
-        // let mut percen
-        // let mut percentage_string = format!("{}%", percentage.to_string());
-        let (movement_style, percentage_string) = if movement < Decimal::from_str("0.0").unwrap() {
-            (Attr::ForegroundColor(color::RED), format!("-{:.5}%", percentage))
-        } else {
-            (Attr::ForegroundColor(color::GREEN), format!("+{:.5}%", percentage))
-        };
-
-        tbl.add_row(Row::new(vec![
-            Cell::new(&share_timeline.code()),
-            Cell::new(&share_timeline.price()),
-            Cell::new(&share_timeline.latest_date()),
-            Cell::new(&share_timeline.historic_price()),
-            Cell::new(&share_timeline.historic_date()),
-            Cell::new(&movement.to_string())
-                .with_style(Attr::Bold)
-                .with_style(movement_style),
-            Cell::new(&percentage_string)
-                .with_style(Attr::Bold)
-                .with_style(movement_style),
-        ]));
-    }
-
-    tbl.printstd();
+    ]
 }
 
-fn price_str_at_moment(share_timeline: ShareTimeLine, moment: ShareHistoryPoint)->String {
-     match share_timeline.get_share_at_moment(moment){
-        Some(share) => share.pretty_price(),
-        _ => String::from("---")
-    }
+//should I return a Vec?? Probably....
+fn construct_price_cell_headers(share_history: &share_price_model::ShareMoment) -> Vec<Cell> {
+    let str_hist = share_history.to_string();
+    vec![
+        make_header(&format!("{} PRICE", str_hist), color::BRIGHT_BLUE),
+        make_header(&format!("{} DATE", str_hist), color::BRIGHT_BLUE),
+        make_header(&format!("{} MOVEMENT", str_hist), color::BRIGHT_YELLOW),
+        make_header("%", color::BRIGHT_YELLOW),
+    ]
 }
+
+fn make_header(col_name: &str, color: color::Color) -> Cell {
+    Cell::new(col_name)
+        .with_style(Attr::Bold)
+        .with_style(Attr::ForegroundColor(color))
+}
+
+fn construct_price_cells(current_share: Share, share_history: (ShareMoment, Share)) {
+    //work out the movement
+    //work out movement percentage
+    //construct 3 cells
+    //share price
+    //share movement
+}
+
+// fn price_str_at_moment(share_timeline: ShareTimeline, moment: ShareHistoryPoint)->String {
+//      match share_timeline.get_share_at_moment(moment){
+//         Some(share) => share.pretty_price(),
+//         _ => String::from("---")
+//     }
+// }
+//
+// fn price_as_decimal_at_moment(share_timeline: ShareTimeline, moment: ShareHistoryPoint) -> Decimal {
+//    Decimal::from_str(&price_str_at_moment(share_timeline, moment))?
+// }
 
 //Save the  current prices
 fn save_prices(company_prices: Vec<ShareTimeline>) -> Result<(), Box<dyn std::error::Error>> {
@@ -255,7 +292,6 @@ fn save_prices(company_prices: Vec<ShareTimeline>) -> Result<(), Box<dyn std::er
 
 fn get_db_connection() -> Result<PooledConn, Box<dyn std::error::Error>> {
     let conn_details = match config_options::read_db_config() {
-
         Ok(connection) => connection,
         Err(e) => panic!("TIME TO DIE, CONNECTION! {}", e.to_string()),
     };

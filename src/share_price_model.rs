@@ -1,5 +1,11 @@
 use chrono::prelude::*;
 use std::collections::HashMap;
+use rust_decimal::Decimal;
+use std::str::FromStr;
+use std::string::ToString;
+use rust_decimal::prelude::Zero;
+use strum_macros::Display;
+use crate::share_price_model;
 
 pub struct Share{
     pub code: String,
@@ -14,27 +20,44 @@ impl Share{
         self.price_date.format(DATE_FMT).to_string()
     }
     pub fn pretty_price(&self) -> String {
-        str::replace(self.share.price().trim(), ",", ".")
+        str::replace(self.price.trim(), ",", ".")
+    }
+    pub fn price_as_decimal(&self) -> Decimal {
+        Decimal::from_str(&self.pretty_price()).unwrap_or_default()
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub enum ShareHistoryPoint{
+#[derive(Debug, PartialEq, Eq, Hash, Display)]
+pub enum ShareMoment {
     Current,
     Yesterday,
     DaysAgo(i32),
     LastWeek,
-    LastMonth
+    LastMonth,
+    LastYear,
 }
 
 pub struct ShareTimeline {
     pub share: Share,
-    pub share_history:HashMap<ShareHistoryPoint, Share>
+    pub share_history:HashMap<ShareMoment, Share>
 }
 
 impl ShareTimeline {
-    pub fn get_share_at_moment(&self, &share_hst_pnt: ShareHistoryPoint) -> Option<&Share> {
+    pub fn get_share_at_moment(&self, share_hst_pnt: &share_price_model::ShareMoment) -> Option<&Share> {
         self.share_history.get(share_hst_pnt)
+    }
+
+    pub fn get_price_at_moment_or_zero(&self, share_hst_pnt: &share_price_model::ShareMoment) -> Decimal {
+       match self.share_history.get(share_hst_pnt) {
+           Some(share) => share.price_as_decimal(),
+           _ => Decimal::zero(),
+       }
+    }
+    pub fn get_pretty_price_at_moment_or_filler(&self, moment: &ShareMoment) -> String {
+        match self.share_history.get(moment){
+            Some(hist_share) => hist_share.price.to_string(),
+            _ => String::from("---"),
+        }
     }
 }
 
