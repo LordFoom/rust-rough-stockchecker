@@ -6,7 +6,7 @@ use std::string::ToString;
 use strum_macros::Display;
 
 pub struct Share{
-    pub code: String,
+    pub company_code: String,
     pub price: String,
     pub price_date: NaiveDateTime,
 }
@@ -25,6 +25,7 @@ impl Share{
     }
 }
 
+
 #[derive(Debug, PartialEq, Eq, Hash, Display)]
 pub enum ShareMoment {
     Yesterday,
@@ -38,3 +39,4 @@ pub struct ShareTimeline {
     pub share_history:HashMap<ShareMoment, Share>
 }
 
+impl ShareTimeline{}

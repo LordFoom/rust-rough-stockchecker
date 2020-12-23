@@ -2,6 +2,7 @@ extern crate prettytable;
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::error::Error;
 use std::string::ToString;
 
 use chrono::prelude::*;
@@ -11,15 +12,20 @@ use mysql::prelude::*;
 use prettytable::{Attr, Cell, color, Row, Table};
 use regex::Regex;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::Zero;
 use select::document::Document;
 use select::predicate::Name;
 
+use crate::chart_grapher::Chart;
 use crate::share_price_model::{Share, ShareMoment, ShareTimeline};
-use rust_decimal::prelude::Zero;
+use std::collections::hash_map::RandomState;
 
 mod share_price_model;
 mod config_options;
 mod db_model;
+mod util;
+mod chart_grapher;
+use log::{debug, error};
 
 fn init() -> ArgMatches {
     App::new("Share price checker")
@@ -34,29 +40,46 @@ fn init() -> ArgMatches {
              // .validator(is_valid_code)
              ,
         )
+        .arg("-c --chart 'Draw chart'")
         .get_matches()
 }
 
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    debug!("Starting stockchecker...");
     let args = init();
+    debug!("stockchecker inited...");
+
     let company_codes: Vec<_> = args.values_of("code").unwrap().collect();
-    let company_prices = get_company_prices(company_codes).await?;
-    print_prices(&company_prices);
-    if let Err(e) = save_prices(company_prices) {
-        panic!("Couldn't save prices {}", e.to_string())
+    if args.is_present("chart") {
+        let company_price_data :HashMap<String,Vec<Share>>= get_historical_price_data(company_codes).await;
+        print_price_chart(&company_price_data);
+    } else {
+        let company_prices = get_company_prices(company_codes).await?;
+        print_price_table(&company_prices);
+        if let Err(e) = save_prices(company_prices) {
+            panic!("Couldn't save prices {}", e.to_string())
+        }
     }
 
-
     Ok(())
+}
+
+async fn get_historical_price_data(company_codes: Vec<&str>) -> HashMap<String, Vec<Share>> {
+    let mut hist_data = HashMap::new();
+    for code in company_codes {
+        hist_data.insert(code.to_string(), load_complete_share_history(code));
+    }
+    hist_data
 }
 
 /**
 Will return a vector of a map of a company
 */
 // #[tokio::main]
-async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<ShareTimeline>, Box<dyn std::error::Error>> {
+async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<ShareTimeline>, Box<dyn Error>> {
     let mut company_prices = Vec::new();
     for company_code in company_codes {
         let res = reqwest::get(&format!("https://www.google.com/search?hl=en&q=share+price+{}", company_code)).await?;
@@ -81,7 +104,7 @@ async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<ShareTimelin
         //create share object from whence we just loaded
         let now = Utc::now().naive_utc();
         let company_curr = Share {
-            code: company_code.to_string(),
+            company_code: company_code.to_string(),
             price: price.clone(),
             price_date: now,
         };
@@ -93,16 +116,15 @@ async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<ShareTimelin
         //todo, we need to move this into its own method and out of here
         let mut share_history = HashMap::new();
 
-        if let Some(share) = load_share_history(company_code, 1) {
+        if let Some(share) = load_share_history_segments(company_code, 1) {
             share_history.insert(ShareMoment::Yesterday, share);
         }
-        if let Some(share) = load_share_history(company_code, 7) {
+        if let Some(share) = load_share_history_segments(company_code, 7) {
             share_history.insert(ShareMoment::LastWeek, share);
         }
-        if let Some(share) = load_share_history(company_code, 30) {
+        if let Some(share) = load_share_history_segments(company_code, 30) {
             share_history.insert(ShareMoment::LastMonth, share);
         }
-
 
         let share_timeline = ShareTimeline {
             share: company_curr,
@@ -113,7 +135,25 @@ async fn get_company_prices(company_codes: Vec<&str>) -> Result<Vec<ShareTimelin
     Ok(company_prices)
 }
 
-fn load_share_history(company_code: &str, days_ago_upper_limit: i32) -> Option<Share> {
+fn load_complete_share_history(company_code: &str) -> Vec<Share> {
+    let mut conn = get_db_connection().unwrap();
+    let share_history = conn.exec_map(r"select company_code, price, price_date
+                                                            from stock_prices WHERE company_code=:code
+                                                            order by id",
+                                      params! { "code"=>company_code, },
+                                      |(company_code, price, price_date)| Share {
+                                          company_code,
+                                          price,
+                                          price_date,
+                                      });
+
+    match share_history {
+        Ok(share_hist) => share_hist,
+        Err(e) => panic!("Error getting share history for {}: {}", company_code, e.to_string()),
+    }
+}
+
+fn load_share_history_segments(company_code: &str, days_ago_upper_limit: i32) -> Option<Share> {
     let mut conn = get_db_connection().unwrap();
     let base_select = r"SELECT company_code as code, price, price_date
                          FROM stock_prices WHERE company_code = :code
@@ -121,7 +161,7 @@ fn load_share_history(company_code: &str, days_ago_upper_limit: i32) -> Option<S
     let yest_select = format!("{} - INTERVAL {} DAY ORDER BY id DESC ", base_select, days_ago_upper_limit);
     match conn.exec_first(yest_select,
                           params! {"code"=>company_code}) {
-        Ok(Some((code, price, price_date))) => Some(Share { code, price, price_date }),
+        Ok(Some((code, price, price_date))) => Some(Share { company_code: code, price, price_date }),
         Ok(None) => None,
         Err(e) => panic!("Unable to get previous company info: {}", e.to_string()),
     }
@@ -129,7 +169,7 @@ fn load_share_history(company_code: &str, days_ago_upper_limit: i32) -> Option<S
 
 fn construct_current_moment_share_columns(share: &share_price_model::Share) -> Vec<Cell> {
     vec![
-        Cell::new(&share.code),
+        Cell::new(&share.company_code),
         Cell::new(&share.pretty_price()).with_style(Attr::ForegroundColor(color::BRIGHT_BLUE)),
         Cell::new(&share.display_date()),
     ]
@@ -138,7 +178,7 @@ fn construct_current_moment_share_columns(share: &share_price_model::Share) -> V
 fn construct_historic_moment_share_columns(share_history_optional: Option<&share_price_model::Share>, share: &share_price_model::Share) -> Vec<Cell> {
     match share_history_optional {
         Some(share_history) => construct_non_default_historic_row_section(share_history, share),
-       None => vec![Cell::new("---"),Cell::new("---"),Cell::new("---"),Cell::new("---") ],
+        None => vec![Cell::new("---"), Cell::new("---"), Cell::new("---"), Cell::new("---")],
     }
 
     //in theory we've taken care of the None just above.....
@@ -170,13 +210,18 @@ fn construct_non_default_historic_row_section(share_history: &Share, share: &Sha
     ]
 }
 
-fn print_prices(company_prices: &Vec<ShareTimeline>) {
+fn print_price_chart(company_prices: &HashMap<String, Vec<Share>>) {
+    Chart::draw_graph(company_prices).unwrap()
+}
+
+
+fn print_price_table(company_prices: &Vec<ShareTimeline>) {
     let mut tbl = Table::new();
     let header_vec = construct_table_header();
     tbl.add_row(Row::new(header_vec));
 
     for share_timeline in company_prices {
-        let mut share_row:Vec<Cell> = Vec::new();
+        let mut share_row: Vec<Cell> = Vec::new();
         share_row.append(&mut construct_current_moment_share_columns(&share_timeline.share));
 
         share_row.append(&mut construct_historic_moment_share_columns(share_timeline.share_history.get(&ShareMoment::Yesterday), &share_timeline.share));
@@ -185,7 +230,6 @@ fn print_prices(company_prices: &Vec<ShareTimeline>) {
         share_row.append(&mut construct_historic_moment_share_columns(share_timeline.share_history.get(&ShareMoment::LastYear), &share_timeline.share));
 
         tbl.add_row(Row::new(share_row));
-
     }
 
     tbl.printstd();
@@ -236,7 +280,6 @@ fn make_header(col_name: &str, color: color::Color) -> Cell {
 }
 
 
-
 //Save the  current prices
 fn save_prices(company_prices: Vec<ShareTimeline>) -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = get_db_connection()?;
@@ -261,7 +304,7 @@ fn save_prices(company_prices: Vec<ShareTimeline>) -> Result<(), Box<dyn std::er
         company_prices
             .iter()
             .map(|company_time_line| params! {
-                        "code" => &company_time_line.share.code,
+                        "code" => &company_time_line.share.company_code,
                         "price" => str::replace(&company_time_line.share.price, ",", "."),
                     }
             ))?;
