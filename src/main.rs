@@ -16,7 +16,7 @@ use rust_decimal::prelude::Zero;
 use select::document::Document;
 use select::predicate::Name;
 
-use crate::chart_grapher::Chart;
+use crate::chart_grapher::ChartGrapher;
 use crate::share_price_model::{Share, ShareMoment, ShareTimeline};
 use std::collections::hash_map::RandomState;
 
@@ -211,7 +211,7 @@ fn construct_non_default_historic_row_section(share_history: &Share, share: &Sha
 }
 
 fn print_price_chart(company_prices: &HashMap<String, Vec<Share>>) {
-    Chart::draw_graph(company_prices).unwrap()
+    ChartGrapher::draw_graph(company_prices).unwrap()
 }
 
 
