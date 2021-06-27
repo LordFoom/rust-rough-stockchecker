@@ -26,6 +26,7 @@ mod db_model;
 mod util;
 mod chart_grapher;
 use log::{debug, error};
+use std::str::FromStr;
 
 fn init() -> ArgMatches {
     App::new("Share price checker")
@@ -291,12 +292,16 @@ fn save_prices(company_prices: Vec<ShareTimeline>) -> Result<(), Box<dyn std::er
         r"CREATE TABLE IF NOT EXISTS stock_prices
                  ( id bigint auto_increment,
                    company_code varchar(255),
-                   price decimal(10,2),
+                   price decimal(15,2),
                    price_date datetime,
                    primary key(id)
                  );
                    "
     )?;
+    // for ctl in &company_prices{
+    //     println!("Code:{}", &ctl.share.company_code);
+    //     println!("price:{}", &ctl.share.price.split_whitespace().collect::<String>());
+    // }
     //insert into table
     conn.exec_batch(
         r"INSERT INTO stock_prices(company_code, price, price_date)
@@ -305,7 +310,7 @@ fn save_prices(company_prices: Vec<ShareTimeline>) -> Result<(), Box<dyn std::er
             .iter()
             .map(|company_time_line| params! {
                         "code" => &company_time_line.share.company_code,
-                        "price" => str::replace(&company_time_line.share.price, ",", "."),
+                        "price" => company_time_line.share.price.split_whitespace().collect::<String>(),
                     }
             ))?;
 
